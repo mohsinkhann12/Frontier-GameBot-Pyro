@@ -1,0 +1,120 @@
+import json
+import random
+from datetime import datetime, timedelta
+from hashlib import md5
+from Frontier import bot
+from Frontier.Database.coins_db import add_coins, users_collection
+from pyrogram import filters
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import numpy as np
+
+# Store user trivia attempts in a local dictionary
+user_trivia_attempts = {}
+TOTAL_TRIVIA_PER_DAY = 10
+
+questions = [
+    {
+        "question": "What year did Attack on Titan Season 2 begin airing?",
+        "correct_answer": "2017",
+        "incorrect_answers": ["2018", "2019", "2020"]
+    },
+    {
+        "question": "In Highschool DxD, Koneko Toujou is from what race?",
+        "correct_answer": "Nekomata",
+        "incorrect_answers": ["Kitsune", "Human", "Kappa"]
+    },
+    {
+        "question": "What year does Part 7 of JoJo's Bizarre Adventure take place in?",
+        "correct_answer": "1890",
+        "incorrect_answers": ["1888", "1999", "2003"]
+    },
+    {
+        "question": "In Toriko, which of the following Heavenly Kings has an enhanced sense of Hearing?",
+        "correct_answer": "Zebra",
+        "incorrect_answers": ["Coco", "Sunny", "Toriko"]
+    },
+]
+
+# Trivia command
+@bot.on_message(filters.command("trivia"))
+async def trivia_command(client, message):
+    user_id = message.from_user.id
+    # Check if user reached the daily play limit
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        return await message.reply_text("You are not registered. Please register to play.")
+
+    total_trivia_attempted = user_data.get("trivia_attempted", 0)
+
+    if total_trivia_attempted >= TOTAL_TRIVIA_PER_DAY:
+        return await message.reply_text("You have reached your daily betting limit.")
+
+    # Check if the user has to wait before attempting the next trivia
+    last_attempt_time = user_trivia_attempts.get(user_id, datetime.min)
+    cooldown_time = last_attempt_time + timedelta(minutes=10)
+    if datetime.now() < cooldown_time:
+        remaining_time = (cooldown_time - datetime.now()).seconds // 60
+        return await message.reply_text(f"You need to wait {remaining_time} minutes before playing again.")
+
+    # Get a random trivia question
+    trivia_question = random.choice(questions)
+    question_text = trivia_question["question"]
+    options = [trivia_question["correct_answer"]] + trivia_question["incorrect_answers"]
+
+    # Shuffle options and find the correct answer index
+    np.random.shuffle(options)
+    correct_answer_index = options.index(trivia_question["correct_answer"])
+
+    # Generate a unique identifier for the question using a hash function
+    question_id = md5(question_text.encode()).hexdigest()[:8]
+    callback_data = f"trivia_{question_id}_{user_id}_{correct_answer_index}"
+
+    # Generate inline keyboard with options
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(option, callback_data=f"{callback_data}_{index}")]
+            for index, option in enumerate(options)
+        ]
+    )
+
+    # Send the trivia question to the user
+    await message.reply_text(f"**Question:**\n{question_text}", reply_markup=keyboard)
+
+    # Update user trivia attempt data
+    # Update the user's play count in the database
+    users_collection.update_one({"user_id": user_id}, {"$set": {"trivia_attempted": total_trivia_attempted + 1}})
+
+    user_trivia_attempts[user_id] = datetime.now()
+
+# Callback query handler for trivia answers
+@bot.on_callback_query(filters.regex(r"trivia_"))
+async def trivia_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    data = callback_query.data.split("_")
+    question_id = data[1]
+    user_response_index = int(data[-1])
+
+    # Check if the user has attempted this trivia recently
+    last_attempt_time = user_trivia_attempts.get(user_id, datetime.min)
+    if datetime.now() - last_attempt_time > timedelta(minutes=30):
+        return await callback_query.answer("You have exceeded the time limit for this trivia.", show_alert=True)
+
+    # Check if the selected option is correct
+    trivia_question = next((q for q in questions if md5(q["question"].encode()).hexdigest()[:8] == question_id), None)
+    if not trivia_question:
+        return await callback_query.answer("Invalid trivia question.", show_alert=True)
+
+    options = [trivia_question["correct_answer"]] + trivia_question["incorrect_answers"]
+    np.random.shuffle(options)  # Shuffle options to match the order when generating the keyboard
+    correct_answer_index = options.index(trivia_question["correct_answer"])
+
+    if user_response_index == correct_answer_index:
+        # Award some coins for a correct answer
+        coins_to_award = 50  # You can adjust the amount
+        await add_coins(user_id, coins_to_award)
+        message_text = f"✅ Correct answer! You got {coins_to_award} coins."
+    else:
+        message_text = "❌ Incorrect answer. Better luck next time!"
+
+    # Edit the trivia question message with the result
+    await callback_query.edit_message_text(f"**Question:**\n{question_id}\n\n{message_text}")
